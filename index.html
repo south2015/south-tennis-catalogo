@@ -60,7 +60,7 @@
   .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;cursor:pointer;display:flex;flex-direction:column;transition:transform .15s,border-color .15s;text-align:left}
   .card:hover{transform:translateY(-2px);border-color:#3a3a40}
   .ph{aspect-ratio:4/5;background:var(--surface-2);overflow:hidden;position:relative}
-  .ph img{width:100%;height:100%;object-fit:cover}
+  .ph img{width:100%;height:100%;object-fit:contain}
   .ph .none{position:absolute;inset:0;display:grid;place-items:center;color:var(--muted);font-size:12px;text-align:center;padding:12px}
   .badge{position:absolute;top:8px;left:8px;background:rgba(0,0,0,.7);font-size:11px;font-weight:700;padding:4px 8px;border-radius:999px;letter-spacing:.3px}
   .info{padding:12px;display:flex;flex-direction:column;gap:6px;flex:1}
@@ -78,8 +78,17 @@
   dialog::backdrop{background:rgba(0,0,0,.75)}
   .sheet{background:var(--surface);border:1px solid var(--line);border-radius:20px;overflow:hidden;display:grid;grid-template-columns:1fr;max-height:92vh;overflow-y:auto}
   @media(min-width:760px){.sheet{grid-template-columns:1fr 1fr}}
-  .sheet .big{background:var(--surface-2);aspect-ratio:4/5}
-  .sheet .big img{width:100%;height:100%;object-fit:cover}
+  .sheet .big{background:var(--surface-2);aspect-ratio:4/5;position:relative}
+  .sheet .big img{width:100%;height:100%;object-fit:contain;cursor:zoom-in}
+  .zhint{position:absolute;right:10px;bottom:10px;display:flex;align-items:center;gap:6px;background:rgba(0,0,0,.7);font-size:12px;font-weight:600;padding:6px 10px;border-radius:999px;pointer-events:none}
+
+  /* Visor de zoom */
+  dialog.zoom{width:100vw;height:100vh;height:100dvh;max-width:none;max-height:none;margin:0;background:#000}
+  dialog.zoom::backdrop{background:#000}
+  .zstage{position:absolute;inset:0;overflow:hidden;touch-action:none;cursor:grab}
+  .zstage img{width:100%;height:100%;object-fit:contain;transform-origin:0 0;user-select:none;-webkit-user-drag:none;max-width:none}
+  .zclose{position:absolute;top:calc(14px + env(safe-area-inset-top,0px));right:14px;z-index:2;width:44px;height:44px;border-radius:50%;border:1px solid #333;background:rgba(20,20,22,.85);color:#fff;cursor:pointer;font-size:20px;line-height:1}
+  .ztip{position:absolute;left:50%;bottom:calc(18px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);z-index:2;background:rgba(20,20,22,.85);color:var(--muted);font-size:12px;padding:6px 12px;border-radius:999px;white-space:nowrap;pointer-events:none;transition:opacity .3s}
   .detail{padding:20px;display:flex;flex-direction:column;gap:14px;position:relative}
   .detail h2{font-family:"Archivo Black",sans-serif;font-size:26px;text-transform:uppercase;line-height:1.1;padding-right:36px}
   .detail .price{font-size:22px}
@@ -144,6 +153,12 @@
       <div class="note">Precio sujeto a disponibilidad. Hacemos domicilios.</div>
     </div>
   </div>
+</dialog>
+
+<dialog id="zoom" class="zoom" aria-label="Foto ampliada">
+  <div class="zstage" id="zStage"><img id="zImg" alt="" draggable="false"></div>
+  <button class="zclose" id="zClose" aria-label="Cerrar">✕</button>
+  <div class="ztip" id="zTip">Pellizca o toca dos veces para hacer zoom</div>
 </dialog>
 
 <a class="fab" id="fab" target="_blank" rel="noopener" aria-label="Escríbenos por WhatsApp">
@@ -213,7 +228,10 @@
   }
 
   function open(p){
-    $("#dImg").innerHTML = p.foto ? `<img src="${esc(p.foto)}" alt="${esc(p.nombre)}">` : `<div class="ph" style="height:100%"><div class="none">Foto próximamente</div></div>`;
+    $("#dImg").innerHTML = p.foto
+      ? `<img src="${esc(p.foto)}" alt="${esc(p.nombre)}"><span class="zhint"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5M11 8v6M8 11h6"/></svg>Toca para ampliar</span>`
+      : `<div class="ph" style="height:100%"><div class="none">Foto próximamente</div></div>`;
+    $("#dImg").onclick = p.foto ? () => openZoom(p.foto, p.nombre) : null;
     $("#dName").textContent = p.nombre;
     $("#dPrice").textContent = money(p.precioMin);
     const wa = $("#dWa"), waTxt = $("#dWaTxt");
@@ -231,6 +249,95 @@
     if (state.t && p.tallas.has(state.t)) box.querySelector(`[data-t="${CSS.escape(state.t)}"]`)?.click();
     $("#dlg").showModal();
   }
+
+  // Visor de zoom: pellizcar, doble toque, arrastrar y rueda del mouse
+  const zDlg = $("#zoom"), zStage = $("#zStage"), zImg = $("#zImg");
+  const Z = { s:1, x:0, y:0, max:5 }, ptrs = new Map();
+  let pinch = null, lastTap = { t:0, x:0, y:0 }, moved = false;
+
+  // Rectángulo donde se dibuja realmente la foto (object-fit:contain) a escala 1
+  function fitBox(){
+    const W = zStage.clientWidth, H = zStage.clientHeight;
+    const iw = zImg.naturalWidth || W, ih = zImg.naturalHeight || H;
+    const f = Math.min(W/iw, H/ih), dw = iw*f, dh = ih*f;
+    return { W, H, dw, dh, ox:(W-dw)/2, oy:(H-dh)/2 };
+  }
+  function clampAxis(t, size, d, o, s){
+    return d*s <= size ? (size - d*s)/2 - o*s : Math.min(-o*s, Math.max(size - (o+d)*s, t));
+  }
+  function applyZ(){
+    const b = fitBox();
+    Z.x = clampAxis(Z.x, b.W, b.dw, b.ox, Z.s);
+    Z.y = clampAxis(Z.y, b.H, b.dh, b.oy, Z.s);
+    zImg.style.transform = `translate(${Z.x}px,${Z.y}px) scale(${Z.s})`;
+    zStage.style.cursor = Z.s > 1 ? "grab" : "zoom-in";
+  }
+  function zoomAt(ns, px, py){
+    ns = Math.min(Z.max, Math.max(1, ns));
+    Z.x = px - (px - Z.x) * (ns / Z.s);
+    Z.y = py - (py - Z.y) * (ns / Z.s);
+    Z.s = ns; applyZ();
+  }
+  function resetZ(){ Z.s = 1; Z.x = 0; Z.y = 0; applyZ(); }
+  const local = e => { const r = zStage.getBoundingClientRect(); return { x:e.clientX - r.left, y:e.clientY - r.top }; };
+
+  function openZoom(src, alt){
+    zImg.alt = alt; zImg.style.transform = "";
+    zImg.onload = resetZ; zImg.src = src;
+    if (zImg.complete) resetZ();
+    $("#zTip").style.opacity = 1; setTimeout(() => $("#zTip").style.opacity = 0, 2500);
+    zDlg.showModal();
+  }
+  $("#zClose").onclick = () => zDlg.close();
+  zDlg.addEventListener("close", () => { ptrs.clear(); pinch = null; });
+  window.addEventListener("resize", () => { if (zDlg.open) applyZ(); });
+
+  zStage.addEventListener("pointerdown", e => {
+    zStage.setPointerCapture(e.pointerId);
+    ptrs.set(e.pointerId, local(e));
+    moved = false;
+    if (ptrs.size === 2){
+      const [a,b] = [...ptrs.values()];
+      pinch = { d:Math.hypot(a.x-b.x, a.y-b.y), mx:(a.x+b.x)/2, my:(a.y+b.y)/2 };
+    }
+  });
+  zStage.addEventListener("pointermove", e => {
+    if (!ptrs.has(e.pointerId)) return;
+    const prev = ptrs.get(e.pointerId), cur = local(e);
+    if (Math.hypot(cur.x-prev.x, cur.y-prev.y) > 2) moved = true;
+    ptrs.set(e.pointerId, cur);
+    if (ptrs.size === 2 && pinch){
+      const [a,b] = [...ptrs.values()];
+      const d = Math.hypot(a.x-b.x, a.y-b.y), mx = (a.x+b.x)/2, my = (a.y+b.y)/2;
+      Z.x += mx - pinch.mx; Z.y += my - pinch.my;
+      zoomAt(Z.s * d / pinch.d, mx, my);
+      pinch = { d, mx, my };
+    } else if (ptrs.size === 1 && Z.s > 1){
+      Z.x += cur.x - prev.x; Z.y += cur.y - prev.y; applyZ();
+      zStage.style.cursor = "grabbing";
+    }
+  });
+  function endPtr(e){
+    if (!ptrs.has(e.pointerId)) return;
+    const pt = ptrs.get(e.pointerId);
+    ptrs.delete(e.pointerId);
+    if (ptrs.size < 2) pinch = null;
+    if (e.type === "pointerup" && !moved && ptrs.size === 0){
+      const now = Date.now();
+      if (now - lastTap.t < 320 && Math.hypot(pt.x-lastTap.x, pt.y-lastTap.y) < 30){
+        Z.s > 1 ? resetZ() : zoomAt(2.5, pt.x, pt.y);
+        lastTap.t = 0;
+      } else lastTap = { t:now, x:pt.x, y:pt.y };
+    }
+    applyZ();
+  }
+  zStage.addEventListener("pointerup", endPtr);
+  zStage.addEventListener("pointercancel", endPtr);
+  zStage.addEventListener("wheel", e => {
+    e.preventDefault();
+    const p = local(e);
+    zoomAt(Z.s * Math.exp(-e.deltaY * 0.0015), p.x, p.y);
+  }, { passive:false });
 
   $("#grid").addEventListener("click", e => { const c = e.target.closest(".card"); if (c) open(products[c.dataset.i]); });
   $("#dClose").onclick = () => $("#dlg").close();
